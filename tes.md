@@ -1,48 +1,28 @@
 # MCP Gateway End-to-End Fix — Bippin's Cluster
 
-## Root Cause (Confirmed)
+## Root Cause (CONFIRMED WORKING)
 
-The broker config has `hostname: mcp-server.ocp-mcp-server.svc.cluster.local` but the gateway has NO virtual host for that. The gateway's `mcps` listener only accepts `*.mcp.local` hostnames. So when the broker routes `tools/call` through the gateway Envoy, it gets **404** → "4xx for initialize POST, likely a legacy SSE server".
+The HTTPRoute's `parentRef` was NOT targeting `sectionName: mcps`. This caused the broker config to use the wrong hostname, so the gateway Envoy returned 404 on every `tools/call`.
 
-Working sandbox has: `hostname: openshift-mcp.mcp.local`
+**Fix:** Patch the HTTPRoute parentRef to target the `mcps` listener.
 
 ---
 
-## Step 1: Fix the HTTPRoute hostname
-
-```bash
-oc patch httproute openshift-mcp-server-route -n ocp-mcp-server --type=merge \
-  -p '{"spec":{"hostnames":["openshift-mcp.mcp.local"]}}'
-```
-
-## Step 2: Ensure Gateway has `mcps` listener
-
-```bash
-oc get gateway mcp-gateway -n gateway-system -o jsonpath='{.spec.listeners[*].name}'
-```
-
-If `mcps` is NOT listed, add it:
-
-```bash
-oc patch gateway mcp-gateway -n gateway-system --type=json \
-  -p '[{"op":"add","path":"/spec/listeners/-","value":{"name":"mcps","hostname":"*.mcp.local","port":8080,"protocol":"HTTP","allowedRoutes":{"namespaces":{"from":"All"}}}}]'
-```
-
-## Step 3: Ensure HTTPRoute targets the mcps listener
+## Step 1: Patch HTTPRoute to target `mcps` listener
 
 ```bash
 oc patch httproute openshift-mcp-server-route -n ocp-mcp-server --type=merge \
   -p '{"spec":{"parentRefs":[{"name":"mcp-gateway","namespace":"gateway-system","sectionName":"mcps"}]}}'
 ```
 
-## Step 4: Restart broker to pick up new config
+## Step 2: Restart broker to pick up new config
 
 ```bash
 oc rollout restart deployment/mcp-gateway -n mcp-gateway-system
 oc rollout status deployment/mcp-gateway -n mcp-gateway-system --timeout=60s
 ```
 
-## Step 5: Verify broker config updated
+## Step 3: Verify broker config updated
 
 ```bash
 oc get secret mcp-gateway-config -n mcp-gateway-system -o jsonpath='{.data.config\.yaml}' | base64 -d | grep hostname
@@ -50,9 +30,13 @@ oc get secret mcp-gateway-config -n mcp-gateway-system -o jsonpath='{.data.confi
 
 Must show: `hostname: openshift-mcp.mcp.local`
 
-If it still shows the old hostname, wait 30s and check again (controller needs to reconcile).
+## Step 4: Grant RBAC for MCP server ServiceAccount
 
-## Step 6: Test end-to-end
+```bash
+oc adm policy add-cluster-role-to-user cluster-reader system:serviceaccount:ocp-mcp-server:default
+```
+
+## Step 5: Test end-to-end
 
 ```bash
 export MCP_GATEWAY_HOSTNAME=$(oc get route mcp-gateway -n gateway-system -o jsonpath='{.spec.host}')
@@ -61,17 +45,6 @@ echo "Gateway: $MCP_GATEWAY_HOSTNAME"
 # Get token
 TOKEN=$(oc create token default -n ocp-mcp-server 2>/dev/null)
 if [ -z "$TOKEN" ]; then
-  oc apply -f - <<'TOKEOF'
-apiVersion: v1
-kind: Secret
-metadata:
-  name: test-token
-  namespace: ocp-mcp-server
-  annotations:
-    kubernetes.io/service-account.name: default
-type: kubernetes.io/service-account-token
-TOKEOF
-  sleep 3
   TOKEN=$(oc get secret test-token -n ocp-mcp-server -o jsonpath='{.data.token}' | base64 -d)
 fi
 echo "Token length: ${#TOKEN}"
@@ -99,5 +72,13 @@ curl -sk -X POST "https://${MCP_GATEWAY_HOSTNAME}/mcp" \
 
 ```
 event: message
-data: {"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text":"APIVERSION   KIND   NAME..."}]}}
+data: {"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text":"APIVERSION   KIND        NAME\nv1           Namespace   default\nv1           Namespace   kube-system\n..."}]}}
 ```
+
+## Summary
+
+| What was wrong | Fix |
+|---|---|
+| HTTPRoute parentRef missing `sectionName: mcps` | `oc patch httproute ... sectionName: mcps` |
+| Broker config had wrong hostname | Restart broker after HTTPRoute fix |
+| ServiceAccount lacks cluster-reader | `oc adm policy add-cluster-role-to-user cluster-reader` |

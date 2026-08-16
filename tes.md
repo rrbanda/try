@@ -162,7 +162,20 @@ The broker uses TWO paths:
 - **Discovery** (SSE): connects directly to `url` in config → works
 - **Session/tools/call** (Streamable HTTP): connects through the gateway Envoy using Host `openshift-mcp.mcp.local`
 
-This test simulates EXACTLY what the broker does for `tools/call`:
+### 9a. Check if internal hostname is programmed in Envoy
+
+The Envoy container does NOT have curl. Use `pilot-agent` (built into every Istio proxy):
+
+```bash
+echo "=== Check Envoy vhost count for internal hostname ==="
+VHOST_COUNT=$(oc exec deployment/mcp-gateway-istio -n gateway-system -c istio-proxy -- \
+  pilot-agent request GET /config_dump 2>/dev/null | grep -c 'openshift-mcp.mcp.local')
+echo "Vhost matches: $VHOST_COUNT"
+# If 0 → internal hostname NOT programmed in Envoy → root cause found
+# If >0 → vhost exists, issue is downstream
+```
+
+### 9b. Test 1 — Direct to MCP server (bypass gateway)
 
 ```bash
 echo "=== Test 1: Direct to MCP server (bypass gateway) ==="
@@ -175,8 +188,10 @@ oc run test-direct --rm -i --restart=Never -n mcp-gateway-system \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}'
 ```
 
+### 9c. Test 2 — Through gateway Envoy with internal hostname (simulates broker tools/call path)
+
 ```bash
-echo "=== Test 2: Through gateway Envoy with internal hostname (what broker does for tools/call) ==="
+echo "=== Test 2: Through gateway Envoy with internal hostname ==="
 oc run test-via-gw --rm -i --restart=Never -n mcp-gateway-system \
   --image=registry.access.redhat.com/ubi9/ubi-minimal:latest -- \
   curl -s -w "\nHTTP_CODE:%{http_code}\n" -X POST \
@@ -187,8 +202,10 @@ oc run test-via-gw --rm -i --restart=Never -n mcp-gateway-system \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}'
 ```
 
+### 9d. Test 3 — Broker's actual runtime config
+
 ```bash
-echo "=== Test 3: Check broker's actual config (what URL and hostname it uses) ==="
+echo "=== Test 3: Broker runtime config (what URL and hostname it uses) ==="
 oc get secret mcp-gateway-config -n mcp-gateway-system -o jsonpath='{.data.config\.yaml}' | base64 -d
 ```
 

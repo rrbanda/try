@@ -129,6 +129,7 @@ EOF
 ```bash
 oc label namespace ocp-mcp-server istio-discovery=enabled --overwrite
 oc label namespace gateway-system istio-discovery=enabled --overwrite
+oc label namespace mcp-gateway-system istio-discovery=enabled --overwrite
 ```
 
 ## Restart Everything (Step 7)
@@ -143,7 +144,7 @@ oc rollout status deployment/mcp-gateway -n mcp-gateway-system --timeout=60s
 ## Verify (Step 8)
 
 ```bash
-echo "=== MCPServerRegistration ===" 
+echo "=== MCPServerRegistration ==="
 oc get mcpserverregistrations -n ocp-mcp-server
 
 echo ""
@@ -155,7 +156,52 @@ echo "=== MCP Server config ==="
 oc exec deployment/mcp-server -n ocp-mcp-server -- cat /etc/mcp-config/config.toml
 ```
 
-## End-to-End Test (Step 9)
+## CRITICAL Diagnostic: Isolate the Broker's Session Path (Step 9)
+
+The broker uses TWO paths:
+- **Discovery** (SSE): connects directly to `url` in config → works
+- **Session/tools/call** (Streamable HTTP): connects through the gateway Envoy using Host `openshift-mcp.mcp.local`
+
+This test simulates EXACTLY what the broker does for `tools/call`:
+
+```bash
+echo "=== Test 1: Direct to MCP server (bypass gateway) ==="
+oc run test-direct --rm -i --restart=Never -n mcp-gateway-system \
+  --image=registry.access.redhat.com/ubi9/ubi-minimal:latest -- \
+  curl -s -w "\nHTTP_CODE:%{http_code}\n" -X POST \
+  http://openshift-mcp-server.ocp-mcp-server.svc.cluster.local:8080/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}'
+```
+
+```bash
+echo "=== Test 2: Through gateway Envoy with internal hostname (what broker does for tools/call) ==="
+oc run test-via-gw --rm -i --restart=Never -n mcp-gateway-system \
+  --image=registry.access.redhat.com/ubi9/ubi-minimal:latest -- \
+  curl -s -w "\nHTTP_CODE:%{http_code}\n" -X POST \
+  http://mcp-gateway-istio.gateway-system.svc.cluster.local:8080/mcp \
+  -H "Host: openshift-mcp.mcp.local" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}'
+```
+
+```bash
+echo "=== Test 3: Check broker's actual config (what URL and hostname it uses) ==="
+oc get secret mcp-gateway-config -n mcp-gateway-system -o jsonpath='{.data.config\.yaml}' | base64 -d
+```
+
+### Interpreting Results:
+
+| Test 1 (Direct) | Test 2 (Via Gateway) | Diagnosis |
+|---|---|---|
+| HTTP 200 | HTTP 200 | Both paths work — issue is broker-internal |
+| HTTP 200 | HTTP 404 | **Gateway can't route internal hostname** — Envoy vhost not programmed |
+| HTTP 200 | HTTP 503 | **Gateway can't reach backend** — DestinationRule or mTLS issue |
+| HTTP 4xx | any | MCP server itself rejects — config/image issue |
+
+## End-to-End Test via External Gateway (Step 10)
 
 ```bash
 export MCP_GATEWAY_HOSTNAME=$(oc get route mcp-gateway -n gateway-system -o jsonpath='{.spec.host}')
@@ -198,15 +244,54 @@ curl -sk -X POST "https://${MCP_GATEWAY_HOSTNAME}/mcp" \
   -d '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"openshift_namespaces_list","arguments":{}}}'
 ```
 
-## Expected Result
+## Expected Results
 
-If working, the last curl returns:
-```
-event: message
-data: {"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text":"APIVERSION   KIND        NAME..."}]}}
+**Step 9 — Test 1 (Direct):** HTTP 200 with JSON-RPC response or SSE stream
+**Step 9 — Test 2 (Via Gateway):** HTTP 200 — if NOT, this is the root cause
+**Step 10 — tools/call:** SSE stream with namespace list
+
+If Test 2 fails with 404/503:
+```bash
+echo "=== Check Envoy vhosts for internal hostname ==="
+oc exec deployment/mcp-gateway-istio -n gateway-system -- \
+  curl -s localhost:15000/config_dump?resource=dynamic_route_configs | \
+  python3 -c "import sys,json; d=json.load(sys.stdin); [print(vh['name']) for rc in d.get('configs',[]) for rs in rc.get('dynamic_route_configs',[]) for vh in rs.get('route_config',{}).get('virtual_hosts',[])]" 2>/dev/null || \
+  echo "Try: oc exec deployment/mcp-gateway-istio -n gateway-system -- curl -s localhost:15000/config_dump | grep -c 'openshift-mcp.mcp.local'"
+
+echo ""
+echo "=== Check HTTPRoute targets mcps listener ==="
+oc get httproute openshift-mcp-server-route -n ocp-mcp-server -o yaml | grep -A5 "parentRefs"
+
+echo ""
+echo "=== Check Gateway has mcps listener ==="
+oc get gateway mcp-gateway -n gateway-system -o yaml | grep -A5 "mcps"
 ```
 
-If still failing with "4xx for initialize POST, likely a legacy SSE server":
-- Check broker logs: `oc logs deployment/mcp-gateway -n mcp-gateway-system --tail=50`
-- Verify Istio is healthy: `oc get istio -A` (must NOT show ReconcileError/IstioCNINotFound)
-- The Istio control plane MUST be functional for the gateway to route tools/call traffic
+## If Everything Passes but tools/call STILL Fails (Step 11)
+
+Check broker logs at the exact moment of failure:
+
+```bash
+echo "=== Trigger tools/call and immediately check logs ==="
+# In one terminal, tail logs:
+oc logs -f deployment/mcp-gateway -n mcp-gateway-system &
+LOG_PID=$!
+
+# Wait a moment then fire request
+sleep 2
+curl -sk -X POST "https://${MCP_GATEWAY_HOSTNAME}/mcp" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer ${TOKEN}" \
+  -H "Mcp-Session-Id: ${SESSION_ID}" \
+  -d '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"openshift_namespaces_list","arguments":{}}}'
+
+# Kill log tail
+sleep 3 && kill $LOG_PID 2>/dev/null
+```
+
+Look for these patterns in logs:
+- `server=""` → prefix/routing table not built (MCPServerRegistration uses wrong field)
+- `4xx for initialize POST` → broker can't create session to backend
+- `connection refused` → network/service issue
+- `tls handshake` → mTLS issue (need DestinationRule)

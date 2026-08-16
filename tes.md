@@ -1,34 +1,39 @@
 # MCP Gateway End-to-End Fix — Bippin's Cluster
 
-## Root Cause
+## Status
 
-The `mcp-gateway` v0.7.1 renamed `toolPrefix` → `prefix` in the MCPServerRegistration CRD.
-If the old field name is used, it's **silently ignored** → broker routing table is empty → `server=""` → every `tools/call` fails with "4xx for initialize POST, likely a legacy SSE server".
+- PREFIX is already correctly set to `openshift` ✅ (immutable, confirmed working)
+- `tools/call` still fails → issue is broker-to-MCP-server connectivity during session creation
 
 ---
 
-## Step 1: Check and Fix MCPServerRegistration prefix
+## Step 1: Check broker runtime config
 
 ```bash
-echo "=== Current MCPServerRegistration ==="
-oc get mcpserverregistrations -n ocp-mcp-server -o custom-columns='NAME:.metadata.name,PREFIX:.spec.prefix,TOOLPREFIX:.spec.toolPrefix'
+oc get secret mcp-gateway-config -n mcp-gateway-system -o jsonpath='{.data.config\.yaml}' | base64 -d
 ```
 
-If PREFIX is `<none>` but TOOLPREFIX shows `openshift`, apply the fix:
+Verify output shows:
+- `prefix: openshift` ← must be present
+- `url: http://...` ← the URL broker uses to connect to MCP server
+- `credential:` ← token for authenticating to MCP server
+
+## Step 2: Check broker logs for the actual error
 
 ```bash
-oc patch mcpserverregistration openshift-mcp-server-reg -n ocp-mcp-server --type=merge \
-  -p '{"spec":{"prefix":"openshift"}}'
+oc logs deployment/mcp-gateway -n mcp-gateway-system --tail=50 | grep -i "server\|error\|initialize\|session\|4xx"
 ```
 
-## Step 2: Restart the broker
+## Step 3: Restart the broker
+
+## Step 3: Restart the broker
 
 ```bash
 oc rollout restart deployment/mcp-gateway -n mcp-gateway-system
 oc rollout status deployment/mcp-gateway -n mcp-gateway-system --timeout=60s
 ```
 
-## Step 3: Verify broker picks up the prefix
+## Step 4: Verify broker picks up the prefix
 
 ```bash
 oc get mcpserverregistrations -n ocp-mcp-server -o custom-columns='NAME:.metadata.name,PREFIX:.spec.prefix,STATE:.status.state'
@@ -36,7 +41,7 @@ oc get mcpserverregistrations -n ocp-mcp-server -o custom-columns='NAME:.metadat
 
 PREFIX must show `openshift`. STATE must show `Enabled`.
 
-## Step 4: Test end-to-end
+## Step 5: Test end-to-end
 
 ```bash
 export MCP_GATEWAY_HOSTNAME=$(oc get route mcp-gateway -n gateway-system -o jsonpath='{.spec.host}')

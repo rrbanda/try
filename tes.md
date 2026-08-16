@@ -1,47 +1,58 @@
 # MCP Gateway End-to-End Fix — Bippin's Cluster
 
-## Status
+## Root Cause (Confirmed)
 
-- PREFIX is already correctly set to `openshift` ✅ (immutable, confirmed working)
-- `tools/call` still fails → issue is broker-to-MCP-server connectivity during session creation
+The broker config has `hostname: mcp-server.ocp-mcp-server.svc.cluster.local` but the gateway has NO virtual host for that. The gateway's `mcps` listener only accepts `*.mcp.local` hostnames. So when the broker routes `tools/call` through the gateway Envoy, it gets **404** → "4xx for initialize POST, likely a legacy SSE server".
+
+Working sandbox has: `hostname: openshift-mcp.mcp.local`
 
 ---
 
-## Step 1: Check broker runtime config
+## Step 1: Fix the HTTPRoute hostname
 
 ```bash
-oc get secret mcp-gateway-config -n mcp-gateway-system -o jsonpath='{.data.config\.yaml}' | base64 -d
+oc patch httproute openshift-mcp-server-route -n ocp-mcp-server --type=merge \
+  -p '{"spec":{"hostnames":["openshift-mcp.mcp.local"]}}'
 ```
 
-Verify output shows:
-- `prefix: openshift` ← must be present
-- `url: http://...` ← the URL broker uses to connect to MCP server
-- `credential:` ← token for authenticating to MCP server
-
-## Step 2: Check broker logs for the actual error
+## Step 2: Ensure Gateway has `mcps` listener
 
 ```bash
-oc logs deployment/mcp-gateway -n mcp-gateway-system --tail=50 | grep -i "server\|error\|initialize\|session\|4xx"
+oc get gateway mcp-gateway -n gateway-system -o jsonpath='{.spec.listeners[*].name}'
 ```
 
-## Step 3: Restart the broker
+If `mcps` is NOT listed, add it:
 
-## Step 3: Restart the broker
+```bash
+oc patch gateway mcp-gateway -n gateway-system --type=json \
+  -p '[{"op":"add","path":"/spec/listeners/-","value":{"name":"mcps","hostname":"*.mcp.local","port":8080,"protocol":"HTTP","allowedRoutes":{"namespaces":{"from":"All"}}}}]'
+```
+
+## Step 3: Ensure HTTPRoute targets the mcps listener
+
+```bash
+oc patch httproute openshift-mcp-server-route -n ocp-mcp-server --type=merge \
+  -p '{"spec":{"parentRefs":[{"name":"mcp-gateway","namespace":"gateway-system","sectionName":"mcps"}]}}'
+```
+
+## Step 4: Restart broker to pick up new config
 
 ```bash
 oc rollout restart deployment/mcp-gateway -n mcp-gateway-system
 oc rollout status deployment/mcp-gateway -n mcp-gateway-system --timeout=60s
 ```
 
-## Step 4: Verify broker picks up the prefix
+## Step 5: Verify broker config updated
 
 ```bash
-oc get mcpserverregistrations -n ocp-mcp-server -o custom-columns='NAME:.metadata.name,PREFIX:.spec.prefix,STATE:.status.state'
+oc get secret mcp-gateway-config -n mcp-gateway-system -o jsonpath='{.data.config\.yaml}' | base64 -d | grep hostname
 ```
 
-PREFIX must show `openshift`. STATE must show `Enabled`.
+Must show: `hostname: openshift-mcp.mcp.local`
 
-## Step 5: Test end-to-end
+If it still shows the old hostname, wait 30s and check again (controller needs to reconcile).
+
+## Step 6: Test end-to-end
 
 ```bash
 export MCP_GATEWAY_HOSTNAME=$(oc get route mcp-gateway -n gateway-system -o jsonpath='{.spec.host}')
@@ -90,18 +101,3 @@ curl -sk -X POST "https://${MCP_GATEWAY_HOSTNAME}/mcp" \
 event: message
 data: {"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text":"APIVERSION   KIND   NAME..."}]}}
 ```
-
-## If Still Failing
-
-Check broker logs immediately after the test:
-
-```bash
-oc logs deployment/mcp-gateway -n mcp-gateway-system --tail=30 | grep -i "server\|error\|initialize"
-```
-
-- If `server=""` still appears → prefix patch didn't take, check: `oc get mcpserverregistration -n ocp-mcp-server -o jsonpath='{.items[0].spec.prefix}'`
-- If `server="ocp-mcp-server/openshift-mcp-server-reg"` but still 4xx → MCP server connectivity issue, run:
-  ```bash
-  oc get secret mcp-gateway-config -n mcp-gateway-system -o jsonpath='{.data.config\.yaml}' | base64 -d
-  ```
-  and verify `url` resolves and `prefix` is populated.

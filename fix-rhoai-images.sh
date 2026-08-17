@@ -2,125 +2,238 @@
 ###############################################################################
 # fix-rhoai-images.sh
 #
-# Quickest fix: copy ONLY the failing RHOAI 3.4.3 images from registry.redhat.io
-# directly to the internal mirror using skopeo (no local disk needed).
+# Quickest fix for RHOAI 3.4.3 ImagePullBackOff in disconnected environments.
+# Auto-discovers failing images from the cluster, then copies them from
+# registry.redhat.io to the internal mirror using skopeo.
+#
+# USAGE (two modes):
+#
+#   Mode 1 — Run directly on a machine with both oc + skopeo + internet:
+#     export MIRROR_REGISTRY="your-internal-registry.example.com/path"
+#     oc login ...
+#     bash fix-rhoai-images.sh
+#
+#   Mode 2 — Two machines (bastion for oc, jumpbox for skopeo):
+#     # On bastion (has oc access):
+#     bash fix-rhoai-images.sh --list-only > failing-images.txt
+#     # Copy failing-images.txt to jumpbox, then:
+#     bash fix-rhoai-images.sh --from-file failing-images.txt
 #
 # Prerequisites:
-#   - Run on a machine that can reach BOTH:
-#     1. registry.redhat.io (internet)
-#     2. binaryrepo.nam.nsroot.net (internal)
 #   - skopeo installed (or podman as fallback)
 #   - Logged into both registries:
-#     podman login registry.redhat.io
-#     podman login binaryrepo.nam.nsroot.net
+#       podman login registry.redhat.io
+#       podman login $MIRROR_REGISTRY
+#   - For auto-discovery: oc CLI logged into the cluster
 #
-# Usage:
-#   bash fix-rhoai-images.sh
+# Compatible with: Linux, macOS, Windows (Git Bash)
 ###############################################################################
 
 set -euo pipefail
 
-MIRROR_REGISTRY="binaryrepo.nam.nsroot.net/docker-cto-dev-local/cti-svcs-orion-177398/rhoai-temp"
+# ========================== CONFIGURATION ==================================
+# Set your internal mirror registry path.
+# The script mirrors images as: $MIRROR_REGISTRY/rhoai/image-name@sha256:...
+MIRROR_REGISTRY="${MIRROR_REGISTRY:-binaryrepo.nam.nsroot.net/docker-cto-dev-local/cti-svcs-orion-177398/rhoai-temp}"
 
-# These are the failing images from the cluster diagnostic (Step 3 output).
-# Update this list with the actual output from:
-#   oc get pods -n redhat-ods-applications -o jsonpath='{range .items[?(@.status.phase!="Running")]}{range .spec.containers[*]}{.image}{"\n"}{end}{end}' | sort -u
-FAILING_IMAGES=(
-"registry.redhat.io/rhoai/odh-dashboard-rhel9@sha256:1909a81998be53fe236a3f8c98965/f6ba0a9dcef74bb245f18ca047d5da421f"
-"registry.redhat.io/rhoai/odh-data-science-pipelines-operator-controller-rhel9@sha256:REPLACE_WITH_ACTUAL_DIGEST"
-"registry.redhat.io/rhoai/odh-feast-operator-rhel9@sha256:b4e5489388ceac8028b14f8d5315c34f842d1f6b20840a7d574338a93e0fa0af"
-"registry.redhat.io/rhoai/odh-kserve-controller-rhel9@sha256:e046443ba557cb4c6c1dec0edb366752f7be0ba146caa2a341ee473c67443a99"
-"registry.redhat.io/rhoai/odh-kf-notebook-controller-rhel9@sha256:c5448747dfb4d6c8c6169c65baa3c1e903c1b3d9c7d497bf45c65ee773481935"
-"registry.redhat.io/rhoai/odh-kuberay-operator-controller-rhel9@sha256:2067376794zc887/be4738a5aa338d23a947e7d32748cb1bbb55fc637721312l"
-"registry.redhat.io/rhoai/odh-llama-stack-k8s-operator-rhel9@sha256:9eb6767db203c1e10aabd695065777763346z2e148d0d40bc951f8c2d5229023"
-"registry.redhat.io/rhoai/odh-kserve-llmisvc-controller-rhel9@sha256:049522704714bed687f646b660d3b872fce966d01579b3527cc92cdb6ba7bdd7"
-"registry.redhat.io/rhoai/odh-mlflow-operator-rhel9@sha256:4bcfdd1bb9b0103aeb072315d9130644fd3f3eb24fa8f7752c7863a89c27df59b"
-"registry.redhat.io/rhoai/odh-model-registry-operator-rhel9@sha256:ae7fec9f9ff4399069ac44397b88554d366ed1c3e4f1c1a37d02ef777974d6d6"
-"registry.redhat.io/rhoai/odh-model-serving-api-rhel9@sha256:ef5837f9ddd7acd0376fd1386fdc2e2bde2e9fe4091aa6533df6207209309"
-"registry.redhat.io/rhoai/odh-notebook-controller-rhel9@sha256:c90f6d78238893945c61e6d91fdef3b692d0360c91f105a6d4ad9b7cb4d4aa"
-"registry.redhat.io/rhoai/odh-model-controller-rhel9@sha256:37be2ec73a8424182e903a605c4503f8e6c759a8cc105b1e2ca4ddafad1331dd3"
-"registry.redhat.io/rhoai/odh-trustyai-service-operator-rhel9@sha256:5e0b249f7f4d3037fe9a4007cd8898b27a09269606lfb9b5ff02eb1efc7436389"
-)
+# Namespace where RHOAI components run
+RHOAI_NS="${RHOAI_NS:-redhat-ods-applications}"
+# ===========================================================================
 
+MODE="auto"
+IMAGE_FILE=""
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --list-only)   MODE="list-only"; shift ;;
+    --from-file)   MODE="from-file"; IMAGE_FILE="$2"; shift 2 ;;
+    --help|-h)
+      echo "Usage: $0 [--list-only | --from-file FILE]"
+      echo ""
+      echo "  --list-only    Only print failing images (for offline transfer)"
+      echo "  --from-file F  Read image list from file instead of cluster"
+      echo ""
+      echo "Environment:"
+      echo "  MIRROR_REGISTRY  Target registry path (required for copy)"
+      echo "  RHOAI_NS         RHOAI namespace (default: redhat-ods-applications)"
+      exit 0
+      ;;
+    *) echo "Unknown option: $1"; exit 1 ;;
+  esac
+done
+
+# ========================== DISCOVER FAILING IMAGES =========================
+
+discover_failing_images() {
+  echo "--- Discovering failing images from cluster ---" >&2
+
+  # Get images from pods that are NOT Running/Succeeded
+  local images
+  images=$(oc get pods -n "${RHOAI_NS}" -o json 2>/dev/null | \
+    python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+images = set()
+for pod in data.get('items', []):
+    phase = pod.get('status', {}).get('phase', '')
+    if phase in ('Running', 'Succeeded'):
+        continue
+    # Check container statuses for ImagePullBackOff / ErrImagePull
+    for cs in pod.get('status', {}).get('containerStatuses', []) + pod.get('status', {}).get('initContainerStatuses', []):
+        waiting = cs.get('state', {}).get('waiting', {})
+        if waiting.get('reason', '') in ('ImagePullBackOff', 'ErrImagePull', 'ErrImageNeverPull'):
+            images.add(cs.get('image', ''))
+    # Also grab from spec for pods stuck in Pending
+    if phase == 'Pending':
+        for c in pod.get('spec', {}).get('containers', []) + pod.get('spec', {}).get('initContainers', []):
+            images.add(c.get('image', ''))
+for img in sorted(images):
+    if img and 'registry.redhat.io' in img:
+        print(img)
+" 2>/dev/null || \
+    # Fallback if python3 is not available — use jsonpath
+    oc get pods -n "${RHOAI_NS}" \
+      -o jsonpath='{range .items[*]}{range .status.containerStatuses[*]}{.state.waiting.reason}{"|"}{.image}{"\n"}{end}{end}' 2>/dev/null | \
+      grep -E "^(ImagePullBackOff|ErrImagePull)" | cut -d'|' -f2 | sort -u)
+
+  if [ -z "${images}" ]; then
+    echo "No failing images found in ${RHOAI_NS}. Checking events..." >&2
+    images=$(oc get events -n "${RHOAI_NS}" --field-selector reason=Failed \
+      -o jsonpath='{range .items[*]}{.message}{"\n"}{end}' 2>/dev/null | \
+      grep -oP 'registry\.redhat\.io/[^\s"]+' | sort -u)
+  fi
+
+  echo "${images}"
+}
+
+# ========================== GET IMAGE LIST ==================================
+
+if [ "${MODE}" = "from-file" ]; then
+  if [ ! -f "${IMAGE_FILE}" ]; then
+    echo "ERROR: File not found: ${IMAGE_FILE}"
+    exit 1
+  fi
+  IMAGES=$(grep -v '^#' "${IMAGE_FILE}" | grep -v '^\s*$' | sort -u)
+  echo "Loaded $(echo "${IMAGES}" | wc -l | tr -d ' ') images from ${IMAGE_FILE}"
+else
+  IMAGES=$(discover_failing_images)
+
+  if [ -z "${IMAGES}" ]; then
+    echo "No failing images found. Cluster may be healthy or namespace wrong."
+    echo "Set RHOAI_NS if your namespace differs from 'redhat-ods-applications'."
+    exit 0
+  fi
+
+  IMAGE_COUNT=$(echo "${IMAGES}" | wc -l | tr -d ' ')
+  echo "Found ${IMAGE_COUNT} failing image(s)"
+fi
+
+# ========================== LIST-ONLY MODE ==================================
+
+if [ "${MODE}" = "list-only" ]; then
+  echo ""
+  echo "# Failing RHOAI images (copy this file to a machine with skopeo + internet)"
+  echo "# Then run: bash fix-rhoai-images.sh --from-file THIS_FILE"
+  echo ""
+  echo "${IMAGES}"
+  exit 0
+fi
+
+# ========================== COPY IMAGES =====================================
+
+echo ""
 echo "============================================================"
-echo "  RHOAI 3.4.3 Image Mirror Fix"
+echo "  RHOAI Image Mirror Fix"
+echo "  Source: registry.redhat.io"
 echo "  Target: ${MIRROR_REGISTRY}"
-echo "  Images: ${#FAILING_IMAGES[@]}"
+echo "  Images: $(echo "${IMAGES}" | wc -l | tr -d ' ')"
 echo "============================================================"
 echo ""
 
-# Check if skopeo is available (preferred — no local storage needed)
+# Prefer skopeo (direct copy, no local disk)
 if command -v skopeo &>/dev/null; then
-  COPY_CMD="skopeo"
-  echo "Using skopeo (direct registry-to-registry copy, no local disk needed)"
+  TOOL="skopeo"
+  echo "Using: skopeo (direct registry-to-registry, no local disk needed)"
+elif command -v podman &>/dev/null; then
+  TOOL="podman"
+  echo "Using: podman (requires local disk for pull+push)"
 else
-  COPY_CMD="podman"
-  echo "skopeo not found, falling back to podman (requires local disk for pull/push)"
+  echo "ERROR: Neither skopeo nor podman found. Install one first."
+  exit 1
 fi
 
 echo ""
-echo "--- Verifying registry access ---"
-skopeo login --get-login registry.redhat.io &>/dev/null && echo "  registry.redhat.io: OK" || echo "  registry.redhat.io: NOT LOGGED IN — run: podman login registry.redhat.io"
-skopeo login --get-login binaryrepo.nam.nsroot.net &>/dev/null && echo "  binaryrepo: OK" || echo "  binaryrepo: NOT LOGGED IN — run: podman login binaryrepo.nam.nsroot.net"
+echo "--- Verifying registry logins ---"
+if [ "${TOOL}" = "skopeo" ]; then
+  skopeo login --get-login registry.redhat.io >/dev/null 2>&1 && echo "  registry.redhat.io: OK" || { echo "  registry.redhat.io: NOT LOGGED IN"; echo "  Run: podman login registry.redhat.io"; exit 1; }
+  MIRROR_HOST=$(echo "${MIRROR_REGISTRY}" | cut -d'/' -f1)
+  skopeo login --get-login "${MIRROR_HOST}" >/dev/null 2>&1 && echo "  ${MIRROR_HOST}: OK" || { echo "  ${MIRROR_HOST}: NOT LOGGED IN"; echo "  Run: podman login ${MIRROR_HOST}"; exit 1; }
+fi
 echo ""
 
 SUCCESS=0
 FAILED=0
-SKIPPED=0
+FAILED_LIST=""
 
-for IMAGE in "${FAILING_IMAGES[@]}"; do
-  # Skip placeholder entries
-  if [[ "${IMAGE}" == *"REPLACE_WITH"* ]]; then
-    echo "SKIP: ${IMAGE} (placeholder — replace with actual digest)"
-    ((SKIPPED++))
-    continue
-  fi
+while IFS= read -r IMAGE; do
+  [ -z "${IMAGE}" ] && continue
 
-  # Extract relative path (remove registry.redhat.io/ prefix)
-  REL_PATH=$(echo "${IMAGE}" | sed 's|registry.redhat.io/||')
+  # Build target path:
+  #   registry.redhat.io/rhoai/odh-dashboard-rhel9@sha256:abc123
+  #   becomes: $MIRROR_REGISTRY/rhoai/odh-dashboard-rhel9@sha256:abc123
+  REL_PATH="${IMAGE#registry.redhat.io/}"
   TARGET="${MIRROR_REGISTRY}/${REL_PATH}"
 
-  echo "--- Copying: ${REL_PATH} ---"
+  # For display, truncate the digest
+  SHORT="${REL_PATH%%@*}"
+  DIGEST="${IMAGE##*@}"
+  echo "[$(( SUCCESS + FAILED + 1 ))] ${SHORT}"
+  echo "    digest: ${DIGEST:0:20}..."
 
-  if [ "${COPY_CMD}" = "skopeo" ]; then
-    if skopeo copy "docker://${IMAGE}" "docker://${TARGET}" --all 2>&1; then
-      echo "  OK"
+  if [ "${TOOL}" = "skopeo" ]; then
+    if skopeo copy --all "docker://${IMAGE}" "docker://${TARGET}" 2>/dev/null; then
+      echo "    -> OK"
+      ((SUCCESS++))
+    elif skopeo copy "docker://${IMAGE}" "docker://${TARGET}" 2>/dev/null; then
+      echo "    -> OK (single-arch)"
       ((SUCCESS++))
     else
-      echo "  FAILED — trying without --all flag..."
-      if skopeo copy "docker://${IMAGE}" "docker://${TARGET}" 2>&1; then
-        echo "  OK (single arch)"
-        ((SUCCESS++))
-      else
-        echo "  FAILED"
-        ((FAILED++))
-      fi
+      echo "    -> FAILED"
+      ((FAILED++))
+      FAILED_LIST="${FAILED_LIST}\n  ${IMAGE}"
     fi
   else
-    # Podman fallback
-    if podman pull "${IMAGE}" && podman push "${IMAGE}" "docker://${TARGET}"; then
-      echo "  OK"
+    if podman pull "${IMAGE}" 2>/dev/null && podman tag "${IMAGE}" "${TARGET}" 2>/dev/null && podman push "${TARGET}" 2>/dev/null; then
+      echo "    -> OK"
       ((SUCCESS++))
     else
-      echo "  FAILED"
+      echo "    -> FAILED"
       ((FAILED++))
+      FAILED_LIST="${FAILED_LIST}\n  ${IMAGE}"
     fi
   fi
-  echo ""
-done
+done <<< "${IMAGES}"
 
-echo "============================================================"
-echo "  Results: ${SUCCESS} copied, ${FAILED} failed, ${SKIPPED} skipped"
-echo "============================================================"
 echo ""
+echo "============================================================"
+echo "  RESULTS: ${SUCCESS} copied | ${FAILED} failed"
+echo "============================================================"
 
 if [ ${FAILED} -gt 0 ]; then
-  echo "Some images failed. Check:"
-  echo "  1. Are you logged into both registries?"
-  echo "  2. Does the mirror path exist in Artifactory?"
-  echo "  3. Are the digests correct (copy from cluster output)?"
   echo ""
+  echo "Failed images:"
+  echo -e "${FAILED_LIST}"
+  echo ""
+  echo "Troubleshooting:"
+  echo "  1. Verify registry logins: podman login registry.redhat.io && podman login ${MIRROR_HOST:-your-registry}"
+  echo "  2. Verify the mirror path exists in Artifactory"
+  echo "  3. Check if digests are correct (re-run with --list-only)"
 fi
 
-echo "Once images are in the mirror, pods will auto-recover (kubelet retries every ~5 min)."
-echo "Monitor with: oc get pods -n redhat-ods-applications -w"
+echo ""
+echo "--- Next Steps ---"
+echo "1. Pods will auto-retry pulling images (~5 min backoff)"
+echo "2. Speed up recovery: oc delete pods -n ${RHOAI_NS} --field-selector status.phase=Pending"
+echo "3. Monitor: oc get pods -n ${RHOAI_NS} -w"
+echo ""
+echo "Done."

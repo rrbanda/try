@@ -225,3 +225,39 @@ Expected: `HTTP 401` = MCP is working, AuthPolicy is enforcing.
 | RHOAI Dashboard | Broken (ImagePullBackOff) | Mirror 3.4.3 images |
 | RHOAI Operator | Stuck in Installing | Will self-heal once images are mirrored |
 | Root cause | Operator auto-upgraded, new digests not in mirror | Mirror images or pin version |
+
+---
+
+## Step 9: Identify what triggered the pod restarts
+
+> **Key insight:** ANY modification to an ImageDigestMirrorSet or ImageTagMirrorSet
+> triggers an MCO (Machine Config Operator) rollout. This restarts CRI-O on all nodes,
+> which forces all pods to be recreated. If the pods reference new image digests (from
+> a CSV upgrade) that aren't in the mirror, they'll fail with ImagePullBackOff.
+
+```bash
+# Check when the mcp-gateway-mirror IDMS was last modified:
+oc get imagedigestmirrorset mcp-gateway-mirror -o jsonpath='{.metadata.managedFields[*].time}'
+echo ""
+
+# Check ALL IDMS modification times:
+for IDMS in $(oc get imagedigestmirrorset -o name); do
+  echo "${IDMS}: $(oc get ${IDMS} -o jsonpath='{.metadata.managedFields[-1:].time}')"
+done
+
+# Check MachineConfigPool rollout history (when nodes were last updated):
+echo ""
+echo "Worker MCP last updated:"
+oc get mcp worker -o jsonpath='{.status.conditions[?(@.type=="Updated")].lastTransitionTime}'
+echo ""
+
+# Check if MCP rollout is still in progress:
+oc get mcp
+```
+
+**If the MCP worker pool shows `UPDATING=True`:** A node rollout is still in progress.
+Pods on nodes that haven't been updated yet may still be running with old (cached) images.
+
+**If the IDMS modification time matches the pod creation time (~1:48-1:59 PM):**
+That IDMS change is what triggered the restart, which exposed the missing 3.4.3 images.
+

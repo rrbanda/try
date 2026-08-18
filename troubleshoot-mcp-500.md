@@ -1,8 +1,12 @@
 # Troubleshooting: MCP Gateway HTTP 500 — Broker Cannot Reach MCP Server
 
+> **Confirmed:** August 18, 2026 — Step 3 (remove `require_oauth`) resolved 500→200 on live cluster.  
+> Next: AuthPolicy enforcement (Step 9) to make unauthenticated return 401.
+
 > **Symptom:** External `curl` to `https://<GATEWAY>/mcp` returns HTTP 500  
 > **MCP Server logs show:** `"Authentication failed - missing or invalid bearer token"`  
-> **Meaning:** The broker is reaching the MCP server, but the MCP server is rejecting its request.
+> **Meaning:** The broker is reaching the MCP server, but the MCP server is rejecting its request.  
+> **Root cause:** `require_oauth = true` in MCP server config blocks the broker's internal connection.
 
 ---
 

@@ -294,19 +294,68 @@ oc logs -n ${KUADRANT_NS} deployment/authorino -c authorino --tail=30
 
 **If AuthPolicy says "Accepted, Enforced" but unauthenticated still gets 200:**
 
-This means the Envoy WASM plugin can't reach Authorino. Common causes:
-1. The `mcp-gateway` broker pod is in ImagePullBackOff (Step 10)
-2. Envoy gateway pod needs restart
-3. TLS mismatch between Envoy and Authorino
+This means the Envoy WASM plugin can't reach Authorino, OR the WasmPlugin was never created. Common causes:
+1. **No WasmPlugin resource** — RHCL controller didn't create it (most common)
+2. The `mcp-gateway` broker pod is in ImagePullBackOff (Step 10)
+3. Envoy gateway pod needs restart
+4. TLS mismatch between Envoy and Authorino
 
 ```bash
 # 9e. Check the Envoy gateway pod (the one receiving external traffic)
 oc get pods -n gateway-system
 
-# 9f. Check WasmPlugin injection
+# 9f. Check WasmPlugin injection — THIS MUST EXIST for auth to work
 oc get wasmplugin -n gateway-system
+oc get wasmplugin -A
 
-# 9g. Grant OIDC discovery access (required for Authorino to fetch JWKS)
+# 9g. If NO WasmPlugin exists, check these:
+
+# What does the AuthPolicy target?
+oc get authpolicy mcp-auth-policy -n gateway-system -o yaml | grep -A10 "targetRef"
+
+# What Gateway exists?
+oc get gateway -n gateway-system -o yaml | grep -B2 -A5 "name\|gatewayClassName"
+
+# Does the Gateway have kuadrant labels?
+oc get gateway -n gateway-system -o yaml | grep -A5 "labels"
+
+# Check EnvoyFilter (older mechanism, may be used instead)
+oc get envoyfilter -A
+
+# Check RHCL operator logs for why WasmPlugin wasn't created
+oc logs -n rhcl-operator deployment/rhcl-operator-controller-manager --tail=30 2>/dev/null || \
+  oc logs -n rhcl-operator -l control-plane=controller-manager --tail=30
+```
+
+**Fix: If WasmPlugin is missing, the Gateway likely needs a `kuadrant.io/managed` annotation:**
+
+```bash
+# Add Kuadrant annotation to the Gateway
+GATEWAY_NAME=$(oc get gateway -n gateway-system -o custom-columns=NAME:.metadata.name --no-headers | head -1)
+
+oc annotate gateway ${GATEWAY_NAME} -n gateway-system \
+  kuadrant.io/managed="true" --overwrite
+
+# OR label it (depending on RHCL version)
+oc label gateway ${GATEWAY_NAME} -n gateway-system \
+  kuadrant.io/managed="true" --overwrite
+
+# Wait for RHCL to reconcile and create the WasmPlugin
+sleep 10
+oc get wasmplugin -n gateway-system
+```
+
+**If WasmPlugin still not created, manually verify the AuthPolicy targetRef matches the Gateway:**
+
+```bash
+# The targetRef in AuthPolicy must match the Gateway name exactly
+oc get authpolicy mcp-auth-policy -n gateway-system -o jsonpath='{.spec.targetRef}'
+oc get gateway -n gateway-system -o jsonpath='{.metadata.name}'
+# These must match!
+```
+
+```bash
+# 9h. Grant OIDC discovery access (required for Authorino to fetch JWKS)
 oc apply -f - <<EOF
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

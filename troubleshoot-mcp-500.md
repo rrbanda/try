@@ -271,20 +271,42 @@ curl -sk -w "\nHTTP_CODE: %{http_code}\n" \
 
 ## Step 9: Fix AuthPolicy (if unauthenticated gets 200)
 
-If unauthenticated requests pass through, the AuthPolicy isn't enforcing:
+If unauthenticated requests pass through, the AuthPolicy isn't enforcing.
+
+> **NOTE:** RHCL may be installed in `rhcl-operator` namespace instead of `kuadrant-system`.
+> Check both. The Kuadrant CR namespace is where Authorino runs.
 
 ```bash
-# Check AuthPolicy status
+# 9a. Find the RHCL/Kuadrant namespace
+KUADRANT_NS=$(oc get kuadrant -A -o jsonpath='{.items[0].metadata.namespace}' 2>/dev/null)
+echo "Kuadrant namespace: ${KUADRANT_NS}"
+
+# 9b. Check AuthPolicy status
 oc get authpolicy -n gateway-system
-oc get authpolicy -n gateway-system -o yaml | grep -A3 "conditions"
+oc get authpolicy -n gateway-system -o yaml | grep -A5 "conditions"
 
-# Check Authorino is running
-oc get pods -n kuadrant-system | grep authorino
+# 9c. Check Authorino is running
+oc get pods -n ${KUADRANT_NS} | grep authorino
 
-# Check Authorino logs for errors
-oc logs -n kuadrant-system deployment/authorino -c authorino --tail=30
+# 9d. Check Authorino logs for errors
+oc logs -n ${KUADRANT_NS} deployment/authorino -c authorino --tail=30
+```
 
-# Common fix: grant OIDC discovery access
+**If AuthPolicy says "Accepted, Enforced" but unauthenticated still gets 200:**
+
+This means the Envoy WASM plugin can't reach Authorino. Common causes:
+1. The `mcp-gateway` broker pod is in ImagePullBackOff (Step 10)
+2. Envoy gateway pod needs restart
+3. TLS mismatch between Envoy and Authorino
+
+```bash
+# 9e. Check the Envoy gateway pod (the one receiving external traffic)
+oc get pods -n gateway-system
+
+# 9f. Check WasmPlugin injection
+oc get wasmplugin -n gateway-system
+
+# 9g. Grant OIDC discovery access (required for Authorino to fetch JWKS)
 oc apply -f - <<EOF
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -300,8 +322,44 @@ subjects:
   name: system:unauthenticated
 EOF
 
-# Restart Authorino
-oc rollout restart deployment/authorino -n kuadrant-system
+# 9h. Restart Authorino
+oc rollout restart deployment/authorino -n ${KUADRANT_NS}
+
+# 9i. Restart gateway Envoy pod to re-inject WASM config
+oc delete pods -n gateway-system -l istio=mcp-gateway
+```
+
+---
+
+## Step 10: Fix mcp-gateway broker ImagePullBackOff
+
+If the `mcp-gateway` broker pod is in ImagePullBackOff:
+
+```bash
+# 10a. Check which image is failing
+oc get pod -n mcp-gateway-system -l app=mcp-gateway -o jsonpath='{range .items[*]}{.metadata.name}: {.status.containerStatuses[*].image} — {.status.containerStatuses[*].state.waiting.reason}{"\n"}{end}'
+
+# 10b. Get the full image reference
+BROKER_IMAGE=$(oc get deployment mcp-gateway -n mcp-gateway-system -o jsonpath='{.spec.template.spec.containers[0].image}')
+echo "Broker image: ${BROKER_IMAGE}"
+```
+
+**For disconnected environments:** Mirror this image to your internal registry using skopeo:
+
+```bash
+# On a machine with internet access:
+skopeo copy docker://${BROKER_IMAGE} docker://<YOUR_MIRROR>/${BROKER_IMAGE#*/}
+
+# Then ensure your ImageDigestMirrorSet / ImageTagMirrorSet covers this image
+```
+
+**Quick hack (if image is available with a different tag):**
+
+```bash
+# Check available tags in your mirror
+# If you have the image under a different path, patch the deployment:
+oc set image deployment/mcp-gateway -n mcp-gateway-system \
+  mcp-gateway=<YOUR_MIRROR_PATH>/mcp-gateway-rhel9:latest
 ```
 
 ---

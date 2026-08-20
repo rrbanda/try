@@ -241,6 +241,29 @@ curl -sk -o /dev/null -w "HTTP_CODE: %{http_code}\n" \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1.0.0"}}}'
 ```
 
+**If labels don't match (logs say "No resources found"):**
+
+```bash
+# Use actual pod names instead of labels
+# Broker logs:
+oc logs -n mcp-gateway-system $(oc get pods -n mcp-gateway-system -o jsonpath='{.items[0].metadata.name}') --tail=20
+
+# Gateway Envoy logs:
+oc logs -n gateway-system $(oc get pods -n gateway-system -o jsonpath='{.items[0].metadata.name}') --tail=20
+
+# Restart the gateway Envoy to pick up ext_proc (broker) connection
+oc delete pod -n gateway-system $(oc get pods -n gateway-system -o jsonpath='{.items[0].metadata.name}')
+
+# Wait for new pod
+oc get pods -n gateway-system -w
+
+# Re-test after restart
+curl -sk -o /dev/null -w "HTTP_CODE: %{http_code}\n" \
+  -X POST "https://${MCP_GATEWAY_HOSTNAME}/mcp" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1.0.0"}}}'
+```
+
 ---
 
 ## Step 7: Full end-to-end test (after fix)

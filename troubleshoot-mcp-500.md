@@ -539,6 +539,31 @@ oc get events -n rhcl-operator --sort-by='.lastTimestamp' | tail -10
 # 11g2. Get crash logs from the failing pod
 oc logs -n rhcl-operator $(oc get pods -n rhcl-operator | grep CrashLoop | awk '{print $1}' | head -1) --previous --tail=30
 oc logs -n rhcl-operator $(oc get pods -n rhcl-operator | grep CrashLoop | awk '{print $1}' | head -1) --tail=30
+
+# 11g3. Check if OOMKilled
+oc get pod -n rhcl-operator $(oc get pods -n rhcl-operator | grep CrashLoop | awk '{print $1}' | head -1) -o jsonpath='{.status.containerStatuses[0].lastState.terminated.reason}'
+echo ""
+
+# 11g4. Check memory limits
+oc get deployment kuadrant-operator-controller-manager -n rhcl-operator -o jsonpath='{.spec.template.spec.containers[0].resources}'
+echo ""
+
+# 11g5. If OOMKilled — increase memory limit
+oc set resources deployment/kuadrant-operator-controller-manager -n rhcl-operator --limits=memory=512Mi
+
+# 11g6. Wait for pod to stabilize
+oc rollout status deployment/kuadrant-operator-controller-manager -n rhcl-operator --timeout=120s
+
+# 11g7. Then restart gateway to fetch WASM from now-stable service
+oc delete pod -n gateway-system $(oc get pods -n gateway-system -o name | head -1 | cut -d/ -f2)
+sleep 15
+oc get pods -n gateway-system
+
+# 11g8. Re-test
+curl -sk -o /dev/null -w "HTTP_CODE: %{http_code}\n" \
+  -X POST "https://${MCP_GATEWAY_HOSTNAME}/mcp" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1.0.0"}}}'
 ```
 
 **If the pod is running but unreachable from gateway-system (network policy or Istio mTLS):**

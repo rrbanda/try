@@ -494,6 +494,53 @@ oc set image deployment/mcp-gateway -n mcp-gateway-system \
 
 ---
 
+## Step 11: Fix Kuadrant WASM plugin fetch failure (HTTP 503 after gateway restart)
+
+If the gateway Envoy logs show:
+```
+critical envoy wasm: Plugin kuadrant-wasm-shim failed to load
+critical envoy wasm: Plugin configured to fail closed
+```
+
+This means the WASM binary can't be fetched (disconnected environment). Find the source:
+
+```bash
+# 11a. Find which EnvoyFilters contain WASM config
+oc get envoyfilter -n gateway-system
+
+# 11b. Get the WASM binary URL/image reference
+oc get envoyfilter kuadrant-auth-mcp-gateway -n gateway-system -o yaml | grep -i "uri\|url\|image\|wasm\|remote"
+
+# 11c. Also check the other Kuadrant filter
+oc get envoyfilter kuadrant-mcp-gateway -n gateway-system -o yaml | grep -i "uri\|url\|image\|wasm\|remote"
+```
+
+**Once you have the WASM image/URL, mirror it:**
+
+```bash
+# If it's an OCI image (e.g. oci://registry.redhat.io/...):
+skopeo copy docker://<WASM_IMAGE> docker://<YOUR_MIRROR>/<WASM_IMAGE_PATH>
+
+# If it's an HTTP URL, you need to download the .wasm file and serve it internally
+# OR patch the EnvoyFilter to use an OCI reference pointing to your mirror
+```
+
+**Immediate workaround — change fail policy to OPEN (auth won't enforce but routing works):**
+
+```bash
+# Export, modify, and re-apply
+oc get envoyfilter kuadrant-auth-mcp-gateway -n gateway-system -o yaml > /tmp/ef-auth.yaml
+sed -i 's/CLOSED/OPEN/g' /tmp/ef-auth.yaml
+oc apply -f /tmp/ef-auth.yaml
+
+# Restart gateway to pick up change
+oc delete pod -n gateway-system $(oc get pods -n gateway-system -o jsonpath='{.items[0].metadata.name}')
+```
+
+> **Note:** With fail_open, unauthenticated requests will pass through. This is a temporary workaround until the WASM binary is mirrored.
+
+---
+
 ## Quick Reference: Expected state when working
 
 | Component | Status |

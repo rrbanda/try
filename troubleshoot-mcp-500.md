@@ -209,6 +209,38 @@ oc patch route ${ROUTE_NAME} -n gateway-system --type=json \
   -p '[{"op":"replace","path":"/spec/port","value":{"targetPort":"8080"}}]'
 ```
 
+**If port is already 8080 but still getting 503:**
+
+The 503 means Envoy can't reach the broker (ext_proc) or the backend. Check:
+
+```bash
+# 6a. Is the broker pod Running?
+oc get pods -n mcp-gateway-system
+
+# 6b. Check broker logs for errors
+oc logs -n mcp-gateway-system -l app=mcp-gateway --tail=20
+
+# 6c. Check Envoy (gateway) logs for 503 reason
+oc logs -n gateway-system -l istio=mcp-gateway -c istio-proxy --tail=20
+
+# 6d. Check if Envoy ext_proc is configured
+oc exec -n gateway-system $(oc get pods -n gateway-system -l istio=mcp-gateway -o jsonpath='{.items[0].metadata.name}') -c istio-proxy -- \
+  pilot-agent request GET /config_dump 2>/dev/null | grep -i "ext_proc" | head -5
+
+# 6e. Restart gateway pod to pick up new ext_proc config
+oc delete pod -n gateway-system -l istio=mcp-gateway
+oc get pods -n gateway-system -w
+```
+
+After gateway pod restarts with broker available, re-test:
+
+```bash
+curl -sk -o /dev/null -w "HTTP_CODE: %{http_code}\n" \
+  -X POST "https://${MCP_GATEWAY_HOSTNAME}/mcp" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1.0.0"}}}'
+```
+
 ---
 
 ## Step 7: Full end-to-end test (after fix)

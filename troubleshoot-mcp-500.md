@@ -264,6 +264,32 @@ curl -sk -o /dev/null -w "HTTP_CODE: %{http_code}\n" \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1.0.0"}}}'
 ```
 
+**If still 503 after gateway restart — check ext_proc connectivity:**
+
+The 503 means Envoy can't connect to the broker's ext_proc gRPC endpoint.
+
+```bash
+# 6f. Check broker service and endpoints
+oc get svc -n mcp-gateway-system | grep mcp-gateway
+oc get endpoints -n mcp-gateway-system
+
+# 6g. Check if EnvoyExtensionPolicy exists (configures ext_proc on Envoy)
+oc get envoyextensionpolicy -A
+oc get envoyfilter -A
+
+# 6h. Check gateway service and endpoints in gateway-system
+oc get svc -n gateway-system
+oc get endpoints -n gateway-system
+
+# 6i. Test if gateway pod can reach the broker
+oc exec -n gateway-system $(oc get pods -n gateway-system -o jsonpath='{.items[0].metadata.name}') -- \
+  wget -q -O- --timeout=2 http://mcp-gateway.mcp-gateway-system.svc.cluster.local:8080/healthz 2>&1 || echo "Cannot reach broker"
+
+# 6j. Check MCPGatewayExtension status (this triggers ext_proc setup)
+oc get mcpgatewayextension -A
+oc get mcpgatewayextension -A -o yaml | grep -A10 "status"
+```
+
 ---
 
 ## Step 7: Full end-to-end test (after fix)

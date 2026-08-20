@@ -584,6 +584,28 @@ curl -sk -o /dev/null -w "HTTP_CODE: %{http_code}\n" \
   -X POST "https://${MCP_GATEWAY_HOSTNAME}/mcp" \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1.0.0"}}}'
+
+# 11g12. If operator still crashing after 1Gi — diagnose further
+oc get pod -n rhcl-operator $(oc get pods -n rhcl-operator | grep CrashLoop | awk '{print $1}') -o jsonpath='{.status.containerStatuses[0].lastState.terminated.reason}'
+echo ""
+echo "---"
+oc get deployment kuadrant-operator-controller-manager -n rhcl-operator -o jsonpath='{.spec.template.spec.containers[0].resources.limits.memory}'
+echo ""
+echo "---"
+oc logs -n rhcl-operator $(oc get pods -n rhcl-operator | grep CrashLoop | awk '{print $1}') --previous --tail=10
+
+# 11g13. If still OOMKilled — increase to 2Gi
+oc set resources deployment/kuadrant-operator-controller-manager -n rhcl-operator --limits=memory=2Gi
+sleep 60
+oc get pods -n rhcl-operator | grep controller-manager
+
+# 11g14. Once operator is stable (1/1, 0 restarts), restart gateway
+oc delete pod -n gateway-system $(oc get pods -n gateway-system -o name | head -1 | cut -d/ -f2)
+sleep 20
+curl -sk -o /dev/null -w "HTTP_CODE: %{http_code}\n" \
+  -X POST "https://${MCP_GATEWAY_HOSTNAME}/mcp" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1.0.0"}}}'
 ```
 
 **If the pod is running but unreachable from gateway-system (network policy or Istio mTLS):**

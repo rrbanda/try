@@ -532,9 +532,13 @@ oc get endpoints kuadrant-operator-wasm -n rhcl-operator
 # 11f. Check the pod serving the WASM binary
 oc get pods -n rhcl-operator | grep wasm
 
-# 11g. If pod is down, check why
+# 11g. If pod is down/CrashLoopBackOff, check why
 oc get pods -n rhcl-operator -o wide
 oc get events -n rhcl-operator --sort-by='.lastTimestamp' | tail -10
+
+# 11g2. Get crash logs from the failing pod
+oc logs -n rhcl-operator $(oc get pods -n rhcl-operator | grep CrashLoop | awk '{print $1}' | head -1) --previous --tail=30
+oc logs -n rhcl-operator $(oc get pods -n rhcl-operator | grep CrashLoop | awk '{print $1}' | head -1) --tail=30
 ```
 
 **If the pod is running but unreachable from gateway-system (network policy or Istio mTLS):**

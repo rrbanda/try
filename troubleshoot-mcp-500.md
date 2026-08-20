@@ -564,6 +564,26 @@ curl -sk -o /dev/null -w "HTTP_CODE: %{http_code}\n" \
   -X POST "https://${MCP_GATEWAY_HOSTNAME}/mcp" \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1.0.0"}}}'
+
+# 11g9. If still 503 — verify operator is stable and check gateway logs
+oc get pods -n rhcl-operator | grep controller-manager
+oc logs -n gateway-system $(oc get pods -n gateway-system -o name | head -1 | cut -d/ -f2) --tail=20
+
+# 11g10. Wait longer and retry (WASM fetch may need time)
+sleep 30
+curl -sk -o /dev/null -w "HTTP_CODE: %{http_code}\n" \
+  -X POST "https://${MCP_GATEWAY_HOSTNAME}/mcp" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1.0.0"}}}'
+
+# 11g11. If STILL 503 — restart gateway one more time (operator should be stable now)
+oc delete pod -n gateway-system $(oc get pods -n gateway-system -o name | head -1 | cut -d/ -f2)
+sleep 20
+oc get pods -n gateway-system
+curl -sk -o /dev/null -w "HTTP_CODE: %{http_code}\n" \
+  -X POST "https://${MCP_GATEWAY_HOSTNAME}/mcp" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1.0.0"}}}'
 ```
 
 **If the pod is running but unreachable from gateway-system (network policy or Istio mTLS):**

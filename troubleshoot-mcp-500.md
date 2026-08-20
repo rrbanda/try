@@ -517,12 +517,32 @@ oc get envoyfilter kuadrant-mcp-gateway -n gateway-system -o yaml | grep -i "uri
 
 **Once you have the WASM image/URL, mirror it:**
 
-```bash
-# If it's an OCI image (e.g. oci://registry.redhat.io/...):
-skopeo copy docker://<WASM_IMAGE> docker://<YOUR_MIRROR>/<WASM_IMAGE_PATH>
+The WASM binary is served from inside the cluster at:
+`http://kuadrant-operator-wasm.rhcl-operator.svc.cluster.local:8082/plugin.wasm`
 
-# If it's an HTTP URL, you need to download the .wasm file and serve it internally
-# OR patch the EnvoyFilter to use an OCI reference pointing to your mirror
+If the gateway can't fetch it, the service or its pod is down:
+
+```bash
+# 11d. Check the WASM serving service
+oc get svc kuadrant-operator-wasm -n rhcl-operator
+
+# 11e. Check endpoints (must have an IP)
+oc get endpoints kuadrant-operator-wasm -n rhcl-operator
+
+# 11f. Check the pod serving the WASM binary
+oc get pods -n rhcl-operator | grep wasm
+
+# 11g. If pod is down, check why
+oc get pods -n rhcl-operator -o wide
+oc get events -n rhcl-operator --sort-by='.lastTimestamp' | tail -10
+```
+
+**If the pod is running but unreachable from gateway-system (network policy or Istio mTLS):**
+
+```bash
+# 11h. Test connectivity from gateway namespace
+oc exec -n gateway-system $(oc get pods -n gateway-system -o jsonpath='{.items[0].metadata.name}') -c istio-proxy -- \
+  wget -q -O /dev/null --timeout=3 http://kuadrant-operator-wasm.rhcl-operator.svc.cluster.local:8082/plugin.wasm 2>&1 && echo "OK" || echo "FAILED"
 ```
 
 **Immediate workaround — change fail policy to OPEN (auth won't enforce but routing works):**
